@@ -57,96 +57,127 @@ class TeamClassifier:
         self.batch_size = batch_size
         self.n_clusters = n_clusters
         
-        # Khởi tạo models
-        self.features_model = SiglipVisionModel.from_pretrained(SIGLIP_MODEL_PATH).to(device)
-        self.processor = AutoProcessor.from_pretrained(SIGLIP_MODEL_PATH)
+        # Nâng cấp model lên siglip-large để có feature tốt hơn
+        self.features_model = SiglipVisionModel.from_pretrained('google/siglip-large-patch16-224').to(device)
+        self.processor = AutoProcessor.from_pretrained('google/siglip-large-patch16-224')
         
-        # Cải thiện UMAP
-        self.reducer = umap.UMAP(
-            n_components=3,
-            n_neighbors=15,
-            min_dist=0.1,
-            metric='cosine'
-        )
+        # Ensemble của nhiều UMAP với các parameters khác nhau
+        self.reducers = [
+            umap.UMAP(n_components=3, n_neighbors=15, min_dist=0.1, metric='cosine'),
+            umap.UMAP(n_components=3, n_neighbors=30, min_dist=0.2, metric='euclidean'),
+            umap.UMAP(n_components=3, n_neighbors=20, min_dist=0.15, metric='manhattan')
+        ]
         
-        # Cải thiện KMeans
-        self.cluster_model = KMeans(
-            n_clusters=n_clusters,
-            n_init=10,
-            max_iter=300,
-            random_state=42
-        )
+        # Ensemble của nhiều KMeans
+        self.cluster_models = [
+            KMeans(n_clusters=n_clusters, n_init='auto', max_iter=500, random_state=42),
+            KMeans(n_clusters=n_clusters, n_init='auto', max_iter=500, random_state=43),
+            KMeans(n_clusters=n_clusters, n_init='auto', max_iter=500, random_state=44)
+        ]
+
+    def _augment_image(self, image: np.ndarray) -> List[np.ndarray]:
+        """Thực hiện data augmentation đa dạng"""
+        augmented = []
+        # Ảnh gốc
+        augmented.append(image)
+        
+        # Flip ngang
+        augmented.append(cv2.flip(image, 1))
+        
+        # Điều chỉnh độ sáng
+        bright = cv2.convertScaleAbs(image, alpha=1.2, beta=10)
+        dark = cv2.convertScaleAbs(image, alpha=0.8, beta=-10)
+        augmented.extend([bright, dark])
+        
+        # Rotation nhẹ
+        h, w = image.shape[:2]
+        center = (w//2, h//2)
+        for angle in [-10, 10]:
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated = cv2.warpAffine(image, M, (w, h))
+            augmented.append(rotated)
+            
+        return augmented
 
     def extract_features(self, crops: List[np.ndarray]) -> np.ndarray:
-        """
-        Extract features from a list of image crops using the pre-trained
-            SiglipVisionModel.
-
-        Args:
-            crops (List[np.ndarray]): List of image crops.
-
-        Returns:
-            np.ndarray: Extracted features as a numpy array.
-        """
         augmented_crops = []
         for crop in crops:
-            # Thêm flip ngang
-            augmented_crops.append(crop)
-            augmented_crops.append(cv2.flip(crop, 1))
+            augmented_crops.extend(self._augment_image(crop))
             
         crops = [sv.cv2_to_pillow(crop) for crop in augmented_crops]
         
-        # Xử lý theo batch
+        # Xử lý theo batch với gradient accumulation
         batches = create_batches(crops, self.batch_size)
         data = []
         
         with torch.no_grad():
-            for batch in tqdm(batches, desc='Embedding extraction'):
-                inputs = self.processor(
-                    images=batch, 
-                    return_tensors="pt"
-                ).to(self.device)
+            for batch in tqdm(batches, desc='Extracting features'):
+                inputs = self.processor(images=batch, return_tensors="pt").to(self.device)
                 
-                outputs = self.features_model(**inputs)
-                embeddings = torch.mean(outputs.last_hidden_state, dim=1).cpu().numpy()
-                data.append(embeddings)
+                # Lấy features từ nhiều layer khác nhau
+                outputs = self.features_model(**inputs, output_hidden_states=True)
+                
+                # Kết hợp features từ các layer cuối
+                last_hidden_states = outputs.hidden_states[-1]
+                second_last_hidden_states = outputs.hidden_states[-2] 
+                
+                # Weighted average của các layer features
+                combined_features = (0.7 * torch.mean(last_hidden_states, dim=1) + 
+                                  0.3 * torch.mean(second_last_hidden_states, dim=1))
+                
+                data.append(combined_features.cpu().numpy())
 
         return np.concatenate(data)
 
     def fit(self, crops: List[np.ndarray]) -> None:
-        """
-        Fit the classifier model on a list of image crops.
-
-        Args:
-            crops (List[np.ndarray]): List of image crops.
-        """
         data = self.extract_features(crops)
-        projections = self.reducer.fit_transform(data)
-        self.cluster_model.fit(projections)
         
-        # Lưu lại các center để dùng cho predict
-        self.cluster_centers_ = self.cluster_model.cluster_centers_
+        # Fit với ensemble của reducers và clusterers
+        self.fitted_reducers = []
+        self.fitted_clusters = []
+        
+        for reducer in self.reducers:
+            projections = reducer.fit_transform(data)
+            self.fitted_reducers.append(reducer)
+            
+            clusters = []
+            for clusterer in self.cluster_models:
+                clusterer.fit(projections)
+                clusters.append(clusterer)
+            self.fitted_clusters.append(clusters)
 
     def predict(self, crops: List[np.ndarray]) -> np.ndarray:
-        """
-        Predict the cluster labels for a list of image crops.
-
-        Args:
-            crops (List[np.ndarray]): List of image crops.
-
-        Returns:
-            np.ndarray: Predicted cluster labels.
-        """
         if len(crops) == 0:
             return np.array([])
 
         data = self.extract_features(crops)
-        projections = self.reducer.transform(data)
-        predictions = self.cluster_model.predict(projections)
         
-        # Xử lý kết quả augmentation
-        if len(predictions) > len(crops):
-            # Lấy kết quả của ảnh gốc
-            predictions = predictions[::2]
+        # Ensemble prediction
+        all_predictions = []
+        
+        for reducer, cluster_models in zip(self.fitted_reducers, self.fitted_clusters):
+            projections = reducer.transform(data)
             
-        return predictions
+            for clusterer in cluster_models:
+                predictions = clusterer.predict(projections)
+                all_predictions.append(predictions)
+        
+        # Voting để ra kết quả cuối cùng
+        ensemble_predictions = np.stack(all_predictions)
+        final_predictions = np.apply_along_axis(
+            lambda x: np.bincount(x).argmax(), 
+            axis=0, 
+            arr=ensemble_predictions
+        )
+        
+        # Xử lý kết quả augmentation bằng cách lấy mode
+        if len(final_predictions) > len(crops):
+            n_aug = len(final_predictions) // len(crops)
+            reshaped_pred = final_predictions.reshape(-1, n_aug)
+            final_predictions = np.apply_along_axis(
+                lambda x: np.bincount(x).argmax(),
+                axis=1,
+                arr=reshaped_pred
+            )
+            
+        return final_predictions
